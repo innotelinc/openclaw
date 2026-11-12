@@ -1,5 +1,8 @@
 import { renderTriagePrompt } from "../commands/triage-prompt.js";
-import { sanitizeTriageUpdateFailure } from "../commands/triage-update.js";
+import {
+  sanitizeTriageUpdateFailure,
+  type TriageUpdateFailure,
+} from "../commands/triage-update.js";
 import { isPidAlive } from "../shared/pid-alive.js";
 import type {
   ManagedServiceManagerBoundaryOptions,
@@ -14,6 +17,35 @@ export function registerManagedUpdateHandoffTriageTests(
   itUnix: ReturnType<typeof import("vitest").it.runIf>,
   expect: typeof import("vitest").expect,
 ): void {
+  itUnix.each(["before-recovery", "after-recovery"] as const)(
+    "keeps recovery and cleanup terminal when diagnostic reads fail %s",
+    async (diagnosticReadFailure) => {
+      const {
+        state,
+        sentinel,
+        log: helperLog,
+        sensitiveFilesRemoved,
+      } = await runManagedServiceManagerBoundary("systemd", {
+        diagnosticReadFailure,
+        updaterExitCode: 7,
+        helperExitCode: 7,
+        updaterNotification: "consumed",
+        updaterResult: {
+          status: "error",
+          mode: "npm",
+          reason: "build failed",
+          recovery: { serviceRestartSafe: true, version: "1.0.0" },
+        },
+      });
+      expect(state).toMatchObject({ restored: true, healthProbeCount: 1 });
+      expect(state.triageCalls).toBeUndefined();
+      expect(sentinel).toBeNull();
+      expect(sensitiveFilesRemoved).toBe(true);
+      expect(helperLog).toContain("update triage could not complete");
+      expect(helperLog).toContain("managed update helper completed code=7");
+    },
+  );
+
   itUnix.each([
     { triageExitCode: 7, triageHang: false, triageMissing: false },
     { triageExitCode: 0, triageHang: true, triageMissing: false },
@@ -22,22 +54,38 @@ export function registerManagedUpdateHandoffTriageTests(
     "preserves update failure after unavailable triage ($triageExitCode, timeout=$triageHang, missing=$triageMissing)",
     async (options) => {
       const secret = "sk-test-preserved-update-secret-1234567890";
-      const { state, sentinel, helperLog, savedFailure, sensitiveFilesRemoved } =
-        await runManagedServiceManagerBoundary("systemd", {
-          ...options,
-          recordedFailure: {
-            error: `Original update failed token=${secret}`,
-            result: {
-              status: "error",
-              mode: "npm",
-              reason: "global-install-failed",
-              before: { version: "2026.8.1" },
-              after: { version: "2026.8.1" },
-              recovery: { serviceRestartSafe: true },
-              steps: [{ name: "package install", exitCode: 42, stderrTail: "Original npm cause" }],
-            },
-          },
-        });
+      const recordedFailure: TriageUpdateFailure = {
+        error: `Original update failed token=${secret}`,
+        result: {
+          status: "error",
+          mode: "npm",
+          reason: "global-install-failed",
+          before: { version: "2026.8.1" },
+          after: { version: "2026.8.1" },
+          recovery: { serviceRestartSafe: true },
+          steps: [{ name: "package install", exitCode: 42, stderrTail: "Original npm cause" }],
+        },
+      };
+      const {
+        state,
+        sentinel,
+        log: helperLog,
+        savedFailure,
+        sensitiveFilesRemoved,
+        triageDeadline,
+      } = await runManagedServiceManagerBoundary("systemd", {
+        ...options,
+        updaterExitCode: 7,
+        helperExitCode: 7,
+        updaterNotification: "published",
+        updaterResult: {
+          status: "error",
+          mode: "npm",
+          reason: "global-install-failed",
+          recovery: { serviceRestartSafe: true, version: "2026.8.1" },
+        },
+        recordedFailure,
+      });
       if (options.triageMissing) {
         expect(state.triageCalls).toBeUndefined();
       } else {
@@ -51,15 +99,7 @@ export function registerManagedUpdateHandoffTriageTests(
       expect(savedFailure).toMatchObject({
         path: expect.stringContaining("/logs/support/openclaw-update-failure-"),
         mode: 0o600,
-        contents: {
-          result: {
-            reason: "global-install-failed",
-            before: { version: "2026.8.1" },
-            after: { version: "2026.8.1" },
-            recovery: { serviceRestartSafe: true },
-            steps: [{ exitCode: 42, stderrTail: "Original npm cause" }],
-          },
-        },
+        contents: { result: recordedFailure.result },
       });
       expect(JSON.stringify(savedFailure)).not.toContain(secret);
       expect(helperLog).toContain(`Saved update failure: ${savedFailure?.path}`);
@@ -70,7 +110,7 @@ export function registerManagedUpdateHandoffTriageTests(
           status: "error",
           doctorHint: expect.stringContaining("openclaw triage"),
           stats: {
-            reason: "managed-service-handoff-failed",
+            reason: "global-install-failed",
             steps: [expect.objectContaining({ name: "service-restore", log: { exitCode: 0 } })],
           },
         },
@@ -84,25 +124,50 @@ export function registerManagedUpdateHandoffTriageTests(
       expect(helperLog).toContain("update triage could not complete");
       if (options.triageHang) {
         expect(typeof state.triageDescendantPid).toBe("number");
+        expect(triageDeadline).toEqual({
+          requestedMs: 60_000,
+          descendantPid: state.triageDescendantPid,
+        });
+        expect(helperLog).toContain("verified recovery command exceeded its update timeout");
         await expect.poll(() => isPidAlive(Number(state.triageDescendantPid))).toBe(false);
       }
     },
   );
 
-  itUnix.each(["dirty", "already-current", "managed-service-handoff-cancelled"] as const)(
-    "classifies a zero-exit skipped updater result before triage: %s",
-    async (updaterSkippedReason) => {
-      const { state, sentinel } = await runManagedServiceManagerBoundary("systemd", {
-        updaterExitCode: 0,
-        updaterSkippedReason,
-      });
-      expect(state.triageCalls).toBe(updaterSkippedReason === "dirty" ? 1 : undefined);
-      expect(state.guardedRestart).toBeUndefined();
+  itUnix.each([
+    { reason: "dirty", failed: true },
+    { reason: "already-current", failed: false },
+    { reason: "managed-service-handoff-cancelled", failed: false },
+    { reason: "restart-health-pending", failed: false },
+    { reason: ["already-current"], failed: true },
+  ])("classifies skipped results before triage: %j", async ({ reason, failed }) => {
+    const { state, sentinel, run } = await runManagedServiceManagerBoundary("systemd", {
+      ledger: true,
+      updaterExitCode: 0,
+      helperExitCode: failed ? 1 : 0,
+      updaterNotification: typeof reason === "string" ? "published" : undefined,
+      updaterResult: {
+        status: "skipped",
+        mode: "npm",
+        reason,
+        recovery: { serviceRestartSafe: true, version: "1.0.0", service: "healthy" },
+      },
+    });
+    expect(state.triageCalls).toBe(failed ? 1 : undefined);
+    expect(state.guardedRestart).toBeUndefined();
+    expect(state.healthProbed).toBeUndefined();
+    expect(run).toMatchObject({
+      phase: "finished",
+      status: "skipped",
+      reason: typeof reason === "string" ? reason : "managed-service-handoff-failed",
+    });
+    // Raw child JSON bypasses the typed sentinel writer.
+    if (typeof reason === "string") {
       expect(sentinel).toMatchObject({
-        payload: { status: "skipped", stats: { reason: updaterSkippedReason } },
+        payload: { status: "skipped", stats: { reason } },
       });
-    },
-  );
+    }
+  });
 
   itUnix.each([
     { recoverySentinel: "retained", recoveryExitCode: 0 },
@@ -112,18 +177,27 @@ export function registerManagedUpdateHandoffTriageTests(
   ] as const)(
     "preserves the updater notification when recovery leaves it $recoverySentinel (exit $recoveryExitCode)",
     async (options) => {
+      const recordedFailure: TriageUpdateFailure = {
+        error: "Original package build diagnostic",
+        result: {
+          status: "error",
+          mode: "npm",
+          reason: "build failed",
+          recovery: { serviceRestartSafe: true },
+          steps: [],
+        },
+      };
       const { sentinel, state } = await runManagedServiceManagerBoundary("systemd", {
         ...options,
-        recordedFailure: {
-          error: "Original package build diagnostic",
-          result: {
-            status: "error",
-            mode: "npm",
-            reason: "build failed",
-            recovery: { serviceRestartSafe: true },
-            steps: [],
-          },
+        updaterExitCode: 7,
+        helperExitCode: 7,
+        updaterResult: {
+          status: "error",
+          mode: "npm",
+          reason: "build failed",
+          recovery: { serviceRestartSafe: true, version: "1.0.0" },
         },
+        recordedFailure,
       });
       expect(state.sentinelAtRecovery).toMatchObject({
         status: "error",
@@ -133,6 +207,7 @@ export function registerManagedUpdateHandoffTriageTests(
       expect(state).toMatchObject({
         triageCalls: 1,
         triageObservedRecovery: true,
+        triageObservedRestored: options.recoveryExitCode === 0,
         triageInputMode: 0o600,
         triageArgs: [
           "triage",
@@ -141,18 +216,10 @@ export function registerManagedUpdateHandoffTriageTests(
           "--update-result",
           expect.any(String),
         ],
-        triageInput: {
-          result: {
-            status: "error",
-            reason: "build failed",
-            recovery: { serviceRestartSafe: true },
-          },
-        },
+        triageInput: { result: recordedFailure.result },
       });
       const recovery =
-        options.recoveryExitCode === 0
-          ? "Helper service recovery succeeded."
-          : "Helper service recovery failed.";
+        options.recoveryExitCode === 0 ? "Service recovery succeeded." : "Service recovery failed.";
       expect(state.triageInput).toHaveProperty(
         "error",
         `Original package build diagnostic\n${recovery}`,
@@ -184,7 +251,12 @@ export function registerManagedUpdateHandoffTriageTests(
                   : [
                       expect.objectContaining({
                         name: "service-restore",
-                        log: { exitCode: options.recoveryExitCode },
+                        log: {
+                          exitCode: options.recoveryExitCode,
+                          ...(options.recoveryExitCode === 1
+                            ? { stderrTail: "managed-service-handoff-restore-failed" }
+                            : {}),
+                        },
                       }),
                     ],
             },
@@ -198,8 +270,15 @@ export function registerManagedUpdateHandoffTriageTests(
     "passes the complete bounded managed failure through triage after long plugin output",
     async () => {
       const secret = "sk-test-managed-plugin-secret-1234567890";
-      const { state, helperLog } = await runManagedServiceManagerBoundary("systemd", {
+      const { state, log: helperLog } = await runManagedServiceManagerBoundary("systemd", {
         updaterExitCode: 1,
+        helperExitCode: 1,
+        updaterResult: {
+          status: "error",
+          mode: "npm",
+          reason: "post-update-plugins",
+          recovery: { serviceRestartSafe: false, reason: "runtime-verification-failed" },
+        },
         recordedFailure: {
           result: {
             status: "error",
@@ -257,28 +336,47 @@ export function registerManagedUpdateHandoffTriageTests(
   itUnix(
     "diagnoses an exported failure when the updater exits zero without a sentinel",
     async () => {
-      const { state, helperLog } = await runManagedServiceManagerBoundary("systemd", {
-        updaterExitCode: 0,
-        recordedFailure: {
-          result: {
-            status: "skipped",
-            mode: "unknown",
-            reason: "not-git-install",
-            recovery: { serviceRestartSafe: true },
-            steps: [],
-          },
+      const recordedFailure: TriageUpdateFailure = {
+        result: {
+          status: "skipped",
+          mode: "unknown",
+          reason: "not-git-install",
+          recovery: { serviceRestartSafe: true },
+          steps: [],
         },
+      };
+      const {
+        commands,
+        state,
+        log: helperLog,
+      } = await runManagedServiceManagerBoundary("systemd", {
+        updaterExitCode: 0,
+        helperExitCode: 1,
+        updaterResult: {
+          status: "skipped",
+          mode: "unknown",
+          reason: "not-git-install",
+          steps: [],
+          durationMs: 0,
+        },
+        recordedFailure,
       });
 
       expect(state).toMatchObject({
         triageCalls: 1,
         triageObservedRecovery: false,
-        triageInput: { result: { status: "skipped", reason: "not-git-install" } },
+        triageObservedRestored: false,
+        triageInput: { result: recordedFailure.result },
       });
       expect(state.guardedRestart).toBeUndefined();
+      expect(
+        commands.some((command) =>
+          /(?:^| )(?:start|reset-failed|enable|bootstrap|kickstart)(?: |$)/.test(command),
+        ),
+      ).toBe(false);
       expect(state.triageInput).toHaveProperty(
         "error",
-        expect.stringContaining("Helper service recovery outcome was not recorded"),
+        expect.stringContaining("Service recovery failed."),
       );
       expect(helperLog).toContain("update triage completed");
     },

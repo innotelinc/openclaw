@@ -1,189 +1,216 @@
-// Process-boundary proof for direct-stop draining after durable channel-turn adoption.
-import { spawn, type ChildProcess } from "node:child_process";
-import { once } from "node:events";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { expect, it } from "vitest";
+import {
+  awaitGateBeforeSettlement,
+  createDeferred,
+  withinTest,
+} from "../../../test/helpers/promise.js";
+import { resolveRuntimeWorkerUrl } from "../../infra/runtime-worker-url.js";
+import {
+  closeOpenClawStateDatabaseByPathAsync,
+  openOpenClawStateDatabase,
+} from "../../state/openclaw-state-db.js";
+import { resolveTestNodeExecPath } from "../../test-utils/node-process.js";
+import { gatewayDirectStopEntrypoints } from "../cli-entrypoint.test-support.js";
+import { formatCliProcessFailure } from "../cli-process-child.test-helpers.js";
+import { createProcessFixtures } from "./run-loop-process.test-support.js";
 
-const CHILD_READY_TIMEOUT_MS = 45_000;
-const TEST_TIMEOUT_MS = 60_000;
-const RELEASE_DELAY_MS = 400;
+const fixtures = createProcessFixtures("direct-stop fixture cleanup failed; retaining state");
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-const children = new Set<ChildProcess>();
+async function waitForFixture(
+  gate: Promise<unknown>,
+  tracked: ReturnType<typeof fixtures.ownChild>,
+  signal: AbortSignal,
+) {
+  await withinTest(
+    awaitGateBeforeSettlement(gate, tracked.closed, "fixture not ready"),
+    signal,
+  ).catch((cause: unknown) => {
+    throw new Error(formatCliProcessFailure({ reason: String(cause), ...tracked.output }), {
+      cause,
+    });
+  });
+}
 
-afterEach(() => {
-  for (const child of children) {
-    child.kill("SIGKILL");
-  }
-  children.clear();
-});
-
-const moduleUrl = (relativePath: string) => pathToFileURL(path.resolve(relativePath)).href;
+const moduleUrl = (entry: Parameters<typeof resolveRuntimeWorkerUrl>[0]) =>
+  resolveRuntimeWorkerUrl(entry).href;
 
 const childScript = `
-  import fs from "node:fs";
-  import path from "node:path";
-  import { createChannelIngressDrain } from ${JSON.stringify(moduleUrl("src/channels/message/ingress-drain.ts"))};
-  import { createChannelIngressQueue } from ${JSON.stringify(moduleUrl("src/channels/message/ingress-queue.ts"))};
-  import {
-    clearActiveEmbeddedRun,
-    setActiveEmbeddedRun,
-  } from ${JSON.stringify(moduleUrl("src/agents/embedded-agent-runner/runs.ts"))};
-  import { getActiveEmbeddedRunCount } from ${JSON.stringify(moduleUrl("src/agents/embedded-agent-runner/active-run-projections.ts"))};
-  import { runGatewayLoop } from ${JSON.stringify(moduleUrl("src/cli/gateway-cli/run-loop.ts"))};
-  import { getActiveGatewayRootWorkCount } from ${JSON.stringify(moduleUrl("src/process/gateway-work-admission.ts"))};
+  import assert from "node:assert/strict";
+  import { writeSync } from "node:fs";
+  import { runGatewayLoop } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.runLoop))};
+  import { writeGatewayRestartIntentSync } from ${JSON.stringify(moduleUrl(gatewayDirectStopEntrypoints.restartIntent))};
+  import { PluginRuntimeCloseRetainedError } from ${JSON.stringify(pathToFileURL(path.resolve("src/plugins/runtime-close-error.ts")).href)};
 
-  const tracePath = process.argv[1];
-  const stateDir = process.argv[2];
-  const trace = (line) => fs.appendFileSync(tracePath, line + "\\n");
-  const keepAlive = setInterval(() => {}, 1_000);
-  const queue = createChannelIngressQueue({
-    channelId: "process-proof",
-    accountId: "direct-stop",
-    stateDir,
-  });
-  let releaseEmbedded;
-  const embeddedMaySettle = new Promise((resolve) => {
-    releaseEmbedded = resolve;
-  });
-  let resolveAdopted;
-  const adopted = new Promise((resolve) => {
-    resolveAdopted = resolve;
-  });
-  const sessionId = "direct-stop-active-work";
-  const sessionKey = "agent:main:process-proof:direct-stop-active-work";
-  const handle = {
-    runId: "run-direct-stop-active-work",
-    queueMessage: async () => {},
-    isStreaming: () => true,
-    isCompacting: () => false,
-    abort: () => trace("embedded-aborted"),
-  };
-  const drain = createChannelIngressDrain({
-    queue,
-    dispatchClaimedEvent: async (_event, lifecycle) => {
-      setActiveEmbeddedRun(sessionId, handle, sessionKey);
-      await lifecycle.onAdopted();
-      trace(
-        "adopted:roots=" +
-          getActiveGatewayRootWorkCount() +
-          ":embedded=" +
-          getActiveEmbeddedRunCount(),
-      );
-      resolveAdopted();
-      await embeddedMaySettle;
-      clearActiveEmbeddedRun(sessionId, handle, sessionKey);
-      trace("embedded-completed");
+  const trace = (line) => writeSync(1, "process proof: " + line + "\\n");
+  if (process.argv[1] === "SIGUSR2") {
+    const { onWorkerRequestMetrics } = await import(${JSON.stringify(pathToFileURL(path.resolve("src/infra/worker-request-diagnostics.ts")).href)});
+    const origin = performance.now();
+    const elapsed = (at = performance.now()) => Number((at - origin).toFixed(1));
+    process.once("SIGUSR2", () => trace("SIGUSR2-received atMs=" + elapsed()));
+    onWorkerRequestMetrics((kind, requestClass, phase, queueDepth, queueWaitMs, durationMs, timing) => {
+      if (kind !== "sqlite_writer") return;
+      trace("worker-timing " + JSON.stringify({
+        op: requestClass === "open" || requestClass === "close" ? requestClass : "execute",
+        requestClass,
+        phase,
+        atMs: elapsed(),
+        queueDepth,
+        queueWaitMs,
+        durationMs,
+        timingMs: Object.fromEntries(
+          Object.entries(timing ?? {}).map(([name, at]) => [name, elapsed(at)]),
+        ),
+      }));
+    });
+  }
+  let starts = 0;
+  const code = await runGatewayLoop({
+    ownsProcessLifecycle: true,
+    onProcessResourcesSettled: (outcome) => {
+      trace("custody:" + outcome);
     },
-  });
-
-  await queue.enqueue("event-direct-stop", { text: "hello" }, { laneKey: sessionKey });
-  process.prependOnceListener("SIGTERM", () => {
-    trace("signal:SIGTERM");
-    setTimeout(() => releaseEmbedded(), ${RELEASE_DELAY_MS});
-  });
-
-  await runGatewayLoop({
     start: async () => {
-      await drain.drainOnce();
-      await adopted;
+      trace("start:" + ++starts);
+      const child = setInterval(() => {}, 1000);
+      if (process.argv[1] === "SIGUSR2") {
+        assert(writeGatewayRestartIntentSync({
+          targetPid: process.pid,
+          intent: { force: true },
+        }));
+      }
       setImmediate(() => trace("gateway-ready"));
       return {
         getTailscaleIngressEndpoint: () => undefined,
         startupSettled: Promise.resolve(),
         close: async () => {
-          trace("gateway-close");
-          drain.dispose();
+          // The child releases its owned handle but cannot confirm final cleanup.
+          clearInterval(child);
+          trace("service-child-cleanup-deadline");
+          throw new PluginRuntimeCloseRetainedError(new Error("service child cleanup deadline"));
         },
       };
     },
-    runtime: {
-      log: () => {},
-      error: () => {},
-      exit: (code) => {
-        clearInterval(keepAlive);
-        trace("process-exit:" + code);
-        process.exit(code);
-      },
-    },
-    lockPort: 19473,
   });
+  trace("loop-returned:" + code);
 `;
 
-function readTrace(tracePath: string): string[] {
-  try {
-    return fs.readFileSync(tracePath, "utf8").split("\n").filter(Boolean);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return [];
+const posixIt = process.platform === "win32" ? it.skip : it;
+
+posixIt.for(["SIGTERM", "SIGUSR2", "historical-SIGTERM"] as const)(
+  "settles child cleanup custody after %s without reusing the runtime",
+  { timeout: 60_000 },
+  async (stopSignal, { signal }) => {
+    // Temporary phase trace for the recurring SIGUSR2 timeout; remove when its cause is fixed.
+    const trace = (phase: string) => {
+      if (stopSignal === "SIGUSR2") {
+        fs.writeSync(2, `[sigusr2-phase] ${phase}\n`);
+      }
+    };
+    const historical = stopSignal === "historical-SIGTERM";
+    const fixtureDir = fixtures.make("openclaw-retained-shutdown-");
+    const stateDir = path.join(fixtureDir, "state");
+    const homeDir = path.join(fixtureDir, "home");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(homeDir, { recursive: true });
+    const env = {
+      ...process.env,
+      HOME: homeDir,
+      NODE_ENV: undefined,
+      NODE_DISABLE_COMPILE_CACHE: "1",
+      NODE_OPTIONS: undefined,
+      OPENCLAW_CONFIG_PATH: path.join(stateDir, "openclaw.json"),
+      OPENCLAW_STATE_DIR: stateDir,
+      OPENCLAW_NO_RESPAWN: "1",
+      ...(stopSignal === "SIGUSR2" ? { OPENCLAW_DIAGNOSTICS: "sqlite.worker-timing" } : {}),
+      VITEST: undefined,
+      ...(historical
+        ? {
+            ESBUILD_BINARY_PATH: createRequire(import.meta.resolve("esbuild")).resolve(
+              `@esbuild/${process.platform}-${process.arch}/bin/esbuild`,
+            ),
+          }
+        : {}),
+    };
+    if (stopSignal === "SIGUSR2") {
+      trace("preseed-open: begin");
+      const database = openOpenClawStateDatabase({ env });
+      trace("preseed-open: complete");
+      trace("preseed-close: begin");
+      await closeOpenClawStateDatabaseByPathAsync(database.path);
+      trace("preseed-close: complete");
     }
-    throw error;
-  }
-}
-
-describe("runGatewayLoop direct-stop active work", () => {
-  const posixIt = process.platform === "win32" ? it.skip : it;
-
-  posixIt(
-    "waits for a rootless adopted channel run before close after an OS SIGTERM",
-    async () => {
-      const fixtureDir = tempDirs.make("openclaw-direct-stop-active-work-");
-      const stateDir = path.join(fixtureDir, "state");
-      const homeDir = path.join(fixtureDir, "home");
-      const tracePath = path.join(fixtureDir, "trace.log");
-      fs.mkdirSync(stateDir, { recursive: true });
-      fs.mkdirSync(homeDir, { recursive: true });
-      const child = spawn(
-        process.execPath,
-        ["--import", "tsx", "--input-type=module", "--eval", childScript, tracePath, stateDir],
-        {
-          cwd: path.resolve("."),
-          env: {
-            ...process.env,
-            HOME: homeDir,
-            NODE_ENV: undefined,
-            NODE_DISABLE_COMPILE_CACHE: "1",
-            NODE_OPTIONS: undefined,
-            OPENCLAW_CONFIG_PATH: path.join(stateDir, "openclaw.json"),
-            OPENCLAW_STATE_DIR: stateDir,
-            VITEST: undefined,
-          },
-          stdio: ["ignore", "pipe", "pipe"],
-        },
+    trace("spawn: begin");
+    const child = spawn(
+      historical ? resolveTestNodeExecPath() : process.execPath,
+      historical
+        ? [
+            "--import",
+            "tsx",
+            new URL(moduleUrl(gatewayDirectStopEntrypoints.brokerCleanupFixture)).pathname,
+          ]
+        : ["--import", "tsx", "--input-type=module", "--eval", childScript, stopSignal],
+      {
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const tracked = fixtures.ownChild(child);
+    if (stopSignal === "SIGUSR2") {
+      child.once("spawn", () => trace(`spawn: pid=${child.pid}`));
+      child.once("close", (code, exitSig) => trace(`child-close: code=${code} signal=${exitSig}`));
+      for (const name of ["stdout", "stderr"] as const) {
+        createInterface({ input: child[name] }).on("line", (line) => trace(`${name}: ${line}`));
+      }
+    }
+    const ready = createDeferred();
+    child.stdout?.on("data", () => {
+      if (tracked.output.stdout.includes("process proof: gateway-ready\n")) {
+        ready.resolve();
+      }
+    });
+    await waitForFixture(ready.promise, tracked, signal);
+    trace("ready");
+    const stoppedAt = Date.now();
+    const sent = child.kill(historical ? "SIGTERM" : stopSignal);
+    trace(`signal-send: ${sent}`);
+    expect(sent).toBe(true);
+    const exit = await withinTest(tracked.closed, signal).catch((cause: unknown) => {
+      throw new Error(formatCliProcessFailure({ reason: String(cause), ...tracked.output }), {
+        cause,
+      });
+    });
+    const diagnostics = `${tracked.output.stdout}\n${tracked.output.stderr}`;
+    expect(exit[0] !== null || exit[1] !== null, diagnostics).toBe(true);
+    if (stopSignal !== "SIGUSR2") {
+      expect(exit, diagnostics).toEqual([0, null]);
+    }
+    expect(Date.now() - stoppedAt, diagnostics).toBeLessThan(10_000);
+    expect(tracked.output.stdout).toContain("process proof: service-child-cleanup-deadline");
+    expect(tracked.output.stdout.match(/process proof: custody:\w+/g), diagnostics).toEqual([
+      `process proof: custody:${historical ? "drained" : "retained"}`,
+    ]);
+    expect(tracked.output.stdout).not.toContain("process proof: start:2");
+    if (historical) {
+      expect(diagnostics).not.toMatch(
+        /hard-exit watchdog deadline|gateway\.(?:restart|stop)_close_failed|; resources remain/,
       );
-      children.add(child);
-      const stderr: Buffer[] = [];
-      child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-
-      await vi.waitFor(
-        () => {
-          expect(readTrace(tracePath), Buffer.concat(stderr).toString("utf8")).toContain(
-            "gateway-ready",
-          );
-        },
-        { timeout: CHILD_READY_TIMEOUT_MS, interval: 25 },
-      );
-      const exited = once(child, "exit") as Promise<
-        [code: number | null, signal: NodeJS.Signals | null]
-      >;
-      expect(child.kill("SIGTERM")).toBe(true);
-
-      const exit = await exited;
-      expect(
-        exit,
-        `${readTrace(tracePath).join(" -> ")}\n${Buffer.concat(stderr).toString("utf8")}`,
-      ).toEqual([0, null]);
-      children.delete(child);
-      const trace = readTrace(tracePath);
-      expect(trace).toContain("adopted:roots=0:embedded=1");
-      expect(trace).not.toContain("embedded-aborted");
-      expect(trace.indexOf("signal:SIGTERM")).toBeLessThan(trace.indexOf("embedded-completed"));
-      expect(trace.indexOf("embedded-completed")).toBeLessThan(trace.indexOf("gateway-close"));
-      expect(trace.indexOf("gateway-close")).toBeLessThan(trace.indexOf("process-exit:0"));
-    },
-    TEST_TIMEOUT_MS,
-  );
-});
+      const broker = /spawn broker ready pid=(\d+)/.exec(diagnostics);
+      expect(broker, diagnostics).not.toBeNull();
+      expect(() => process.kill(Number(broker![1]), 0)).toThrow();
+      const warnings = diagnostics
+        .split("\n")
+        .filter((line) => line.includes("Earlier cleanup failed:"));
+      expect(warnings, diagnostics).toHaveLength(1);
+      expect(warnings[0]).toMatch(/service child cleanup.*hard deadline; pending:/);
+    }
+    if (stopSignal === "SIGUSR2") {
+      expect(diagnostics).toContain("refusing in-process restart");
+    }
+  },
+);

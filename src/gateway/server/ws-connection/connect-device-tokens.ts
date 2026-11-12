@@ -1,4 +1,3 @@
-// Gateway WebSocket device authorization issues the session and bootstrap handoff tokens.
 import { ensureDeviceToken } from "../../../infra/device-pairing-tokens.js";
 import { resolveBootstrapProfileScopesForRole } from "../../../shared/device-bootstrap-profile.js";
 import type {
@@ -10,6 +9,7 @@ export async function issueGatewayConnectDeviceTokens(params: {
   state: AuthenticatedGatewayConnect;
   scopes: string[];
   hasApprovedDeviceBaseline: boolean;
+  isIssuanceCurrent: () => boolean;
 }): Promise<Pick<DeviceAuthorizedGatewayConnect, "deviceToken" | "bootstrapDeviceTokens">> {
   const { state, scopes, hasApprovedDeviceBaseline } = params;
   const {
@@ -32,6 +32,8 @@ export async function issueGatewayConnectDeviceTokens(params: {
           generation: sessionSharedGatewaySessionGeneration,
         }
       : undefined;
+  const nodePrincipal = role === "node" ? state.authResult.openclawId : undefined;
+  // Manual re-pairing stays manual, but its issued role still belongs to this live listing.
   const issuedDeviceGrant =
     !trustedProxyAuthOk && device && hasApprovedDeviceBaseline
       ? await ensureDeviceToken({
@@ -39,6 +41,15 @@ export async function issueGatewayConnectDeviceTokens(params: {
           role,
           scopes,
           issuer: sharedGatewayAuthIssuer,
+          approval:
+            nodePrincipal?.kind === "node" && nodePrincipal.authority
+              ? {
+                  approvedVia: "openclaw-id-node",
+                  peerKey: nodePrincipal.peerKey,
+                  authority: nodePrincipal.authority,
+                }
+              : undefined,
+          isIssuanceCurrent: params.isIssuanceCurrent,
         })
       : null;
   const bootstrapDeviceTokens: DeviceAuthorizedGatewayConnect["bootstrapDeviceTokens"] = [];
@@ -70,6 +81,7 @@ export async function issueGatewayConnectDeviceTokens(params: {
         deviceId: device.id,
         role: bootstrapRole,
         scopes: bootstrapRoleScopes,
+        isIssuanceCurrent: params.isIssuanceCurrent,
       });
       if (!extraToken) {
         continue;

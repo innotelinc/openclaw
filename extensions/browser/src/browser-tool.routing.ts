@@ -1,27 +1,20 @@
-/** Browser tool host, sandbox, and node target resolution. */
+import { hasGatewayToolRoutingContext, listNodes } from "openclaw/plugin-sdk/agent-harness-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { readRuntimeConfig as getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { resolveBrowserNodeTarget } from "./browser-node-routing.js";
-import {
-  getRuntimeConfig,
-  listNodes,
-  resolveBrowserConfig,
-  resolveProfile,
-  getBrowserProfileCapabilities,
-} from "./browser-tool.runtime.js";
+import { resolveBrowserConfig } from "./browser/config.js";
 
-export type BrowserNodeTarget = {
-  nodeId: string;
-  label?: string;
-  commands: string[];
-  pendingDeclaredCommands: string[];
-};
-
-export async function resolveBrowserToolNodeTarget(params: {
-  requestedNode?: string;
-  target?: "sandbox" | "host" | "node";
-  sandboxBridgeUrl?: string;
-  allowHostControl?: boolean;
-  signal?: AbortSignal;
-}): Promise<BrowserNodeTarget | null> {
+export async function resolveBrowserToolNodeTarget(
+  params: {
+    requestedNode?: string;
+    profile?: string;
+    target?: "sandbox" | "host" | "node";
+    sandboxBridgeUrl?: string;
+    allowHostControl?: boolean;
+    signal?: AbortSignal;
+  },
+  getConfig: () => OpenClawConfig = getRuntimeConfig,
+) {
   if (params.allowHostControl === false) {
     if (params.target === "node" || params.requestedNode) {
       throw new Error("Node browser control is disabled by sandbox policy.");
@@ -29,12 +22,12 @@ export async function resolveBrowserToolNodeTarget(params: {
     return null;
   }
 
-  const cfg = getRuntimeConfig();
+  const cfg = getConfig();
   const policy = cfg.gateway?.nodes?.browser;
   const explicitTarget = params.target === "node";
   const requestedNode = params.requestedNode?.trim();
   if (policy?.mode === "off") {
-    resolveBrowserNodeTarget({ nodes: [], policy, requestedNode, explicitTarget });
+    await resolveBrowserNodeTarget({ nodes: () => [], config: cfg, requestedNode, explicitTarget });
     return null;
   }
   if (params.sandboxBridgeUrl?.trim() && !explicitTarget && !requestedNode) {
@@ -43,16 +36,30 @@ export async function resolveBrowserToolNodeTarget(params: {
   if (params.target && !explicitTarget) {
     return null;
   }
-  if (policy?.mode === "manual" && !explicitTarget && !requestedNode && !policy.node?.trim()) {
+  // Browser control can create Gateway auth itself. Credentials do not imply
+  // node routing; standalone runs use the host unless a Gateway route is selected.
+  if (
+    !explicitTarget &&
+    !requestedNode &&
+    !policy?.node?.trim() &&
+    (policy?.mode === "manual" ||
+      (policy?.mode !== "auto" &&
+        !hasGatewayToolRoutingContext() &&
+        cfg.gateway?.mode !== "remote" &&
+        !cfg.gateway?.remote?.url?.trim() &&
+        !process.env.OPENCLAW_GATEWAY_URL?.trim()))
+  ) {
     return null;
   }
-  const node = resolveBrowserNodeTarget({
-    nodes: await listNodes({}, params.signal),
-    policy,
+  const node = await resolveBrowserNodeTarget({
+    nodes: () => listNodes({}, params.signal),
+    config: cfg,
+    profile: params.profile,
     requestedNode,
     explicitTarget,
     requireConnected: true,
   });
+  params.signal?.throwIfAborted();
   return node
     ? {
         nodeId: node.nodeId,
@@ -63,12 +70,15 @@ export async function resolveBrowserToolNodeTarget(params: {
     : null;
 }
 
-export function resolveBrowserBaseUrl(params: {
-  target?: "sandbox" | "host";
-  sandboxBridgeUrl?: string;
-  allowHostControl?: boolean;
-}): string | undefined {
-  const cfg = getRuntimeConfig();
+export function resolveBrowserBaseUrl(
+  params: {
+    target?: "sandbox" | "host";
+    sandboxBridgeUrl?: string;
+    allowHostControl?: boolean;
+  },
+  getConfig: () => OpenClawConfig = getRuntimeConfig,
+): string | undefined {
+  const cfg = getConfig();
   const resolved = resolveBrowserConfig(cfg.browser, cfg);
   const normalizedSandbox = params.sandboxBridgeUrl?.trim() ?? "";
   const target = params.target ?? (normalizedSandbox ? "sandbox" : "host");
@@ -91,43 +101,4 @@ export function resolveBrowserBaseUrl(params: {
     );
   }
   return undefined;
-}
-
-const DEFAULT_EXISTING_SESSION_MANAGE_TIMEOUT_MS = 45_000;
-const EXISTING_SESSION_MANAGE_ACTIONS = new Set([
-  "status",
-  "start",
-  "stop",
-  "profiles",
-  "tabs",
-  "open",
-  "focus",
-  "close",
-]);
-
-function hasExistingSessionProfile(resolved: ReturnType<typeof resolveBrowserConfig>) {
-  return Object.keys(resolved.profiles).some((name) => {
-    const candidate = resolveProfile(resolved, name);
-    return candidate ? getBrowserProfileCapabilities(candidate).usesChromeMcp : false;
-  });
-}
-
-export function resolveBrowserToolTimeoutMs({
-  requestedTimeoutMs,
-  action,
-  isUserBrowserProfile,
-  resolvedBrowser,
-}: {
-  requestedTimeoutMs?: number;
-  action: string;
-  isUserBrowserProfile: boolean;
-  resolvedBrowser: ReturnType<typeof resolveBrowserConfig>;
-}) {
-  return (
-    requestedTimeoutMs ??
-    (EXISTING_SESSION_MANAGE_ACTIONS.has(action) &&
-    (isUserBrowserProfile || (action === "profiles" && hasExistingSessionProfile(resolvedBrowser)))
-      ? DEFAULT_EXISTING_SESSION_MANAGE_TIMEOUT_MS
-      : undefined)
-  );
 }

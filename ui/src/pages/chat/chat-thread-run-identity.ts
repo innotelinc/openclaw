@@ -5,9 +5,10 @@ import {
 import { asNullableRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ChatItem } from "../../lib/chat/chat-types.ts";
-import { normalizeRoleForGrouping } from "../../lib/chat/message-normalizer.ts";
-import { userTurnRunId, type TurnInsertionBounds } from "./chat-thread-items.ts";
-import { chatItemStartsUserTurn, safeNormalizeMessage } from "./chat-turn-boundary.ts";
+import { userTurnRunId } from "../../lib/chat/history-message-identity.ts";
+import type { ChatProjection, TurnInsertionBounds } from "./chat-thread-items.ts";
+import { chatItemStartsUserTurn, isInterSessionMessage } from "./chat-turn-boundary.ts";
+import { knownStreamCausalInterval, persistedSteerTargetRunId } from "./stream-causal-boundary.ts";
 import { readLiveTerminalRunId } from "./terminal-message-identity.ts";
 import { buildToolStreamIdentity, extractToolMessageRefs } from "./tool-stream-identity.ts";
 
@@ -38,47 +39,134 @@ export function optionalBoundaryIdentity(value: unknown): { boundaryId: string }
   return runId ? { boundaryId: `send:${runId}` } : undefined;
 }
 
-export function streamPartRunId(
-  part: Extract<ChatItem, { kind: "stream" | "reading-indicator" | "question" }>,
-): string | undefined {
-  return part.kind === "question" ? undefined : part.runId;
-}
-
-export function streamPartBoundaryId(
-  part: Extract<ChatItem, { kind: "stream" | "reading-indicator" | "question" }>,
-): string | undefined {
-  return part.kind === "question" ? undefined : part.boundaryId;
-}
-
-function isUserChatItem(item: ChatItem): boolean {
-  if (item.kind !== "message") {
-    return false;
-  }
-  const normalized = safeNormalizeMessage(item.message);
-  return normalized ? normalizeRoleForGrouping(normalized.role).toLowerCase() === "user" : false;
+export function createToolCallLookup<Value>() {
+  const exact = new Map<string, Value>();
+  const unique = new Map<string, Value | null>();
+  return {
+    add(runId: string | undefined, callId: string | undefined, value: Value) {
+      if (!callId) {
+        return;
+      }
+      if (runId) {
+        exact.set(buildToolStreamIdentity(runId, callId), value);
+      }
+      // Ambiguity belongs to each fact, not the whole call. Even equal values
+      // from two occurrences cannot identify an unscoped owner.
+      unique.set(callId, unique.has(callId) ? null : value);
+    },
+    get(runId: string | undefined, callId: string | undefined): Value | undefined {
+      return callId
+        ? ((runId ? exact.get(buildToolStreamIdentity(runId, callId)) : undefined) ??
+            unique.get(callId) ??
+            undefined)
+        : undefined;
+    },
+  };
 }
 
 export function findCurrentTurnBounds(items: ChatItem[]): TurnInsertionBounds | null {
-  const index = items.findLastIndex(isUserChatItem);
-  const item = items[index];
-  return index >= 0 && item ? { afterKey: item.key } : null;
+  const userTurn = items.findLast(
+    (item) => item.kind === "message" && chatItemStartsUserTurn(item),
+  );
+  return userTurn ? { afterKey: userTurn.key } : null;
 }
 
-export function findRunTurnBounds(items: ChatItem[], runId: string): TurnInsertionBounds | null {
-  const index = items.findIndex(
-    (item) =>
-      item.kind === "message" && isUserChatItem(item) && userTurnRunId(item.message) === runId,
-  );
-  const item = items[index];
-  if (index < 0 || !item) {
-    return null;
-  }
-  const nextUser = items.slice(index + 1).find(isUserChatItem);
-  return { afterKey: item.key, ...(nextUser ? { beforeKey: nextUser.key } : {}) };
+export function createRunTurnLookup(items: ChatItem[]) {
+  let bounds: Map<string, TurnInsertionBounds> | undefined;
+  const inputs = new Map<string, TurnInsertionBounds>();
+  const pagedInputCeilings = new Map<string, TurnInsertionBounds>();
+  const causalBounds = new Map<string, Map<string | undefined, TurnInsertionBounds | null>>();
+  let messages: unknown[] | undefined;
+  const startsExecutionTurn = (item: ChatItem) =>
+    chatItemStartsUserTurn(item) &&
+    !(
+      item.kind === "message" &&
+      asRecord(item.message)?.role === "assistant" &&
+      isInterSessionMessage(item.message)
+    );
+  return (runId: string, afterUserSendId?: string): TurnInsertionBounds | null => {
+    if (!bounds) {
+      bounds = new Map();
+      let previousInput: TurnInsertionBounds | undefined;
+      const open = new Map<string, TurnInsertionBounds>();
+      // Accepted steers divide the transcript, not the run they continue.
+      // Keep that run open, but cap unrelated runs at every user boundary.
+      for (const item of items) {
+        // Forwarded activity divides presentation, not the parent execution.
+        // Its projected assistant role must not cap that run's live output.
+        if (!startsExecutionTurn(item)) {
+          continue;
+        }
+        if (previousInput) {
+          previousInput.beforeKey = item.key;
+        }
+        previousInput = { afterKey: item.key };
+        const sendId =
+          item.kind === "message" ? readSessionMessageIdentity(item.message)?.sendId : null;
+        if (sendId) {
+          inputs.set(sendId, previousInput);
+        }
+        const target = item.kind === "message" ? persistedSteerTargetRunId(item.message) : null;
+        for (const [owner, interval] of open) {
+          if (owner !== target) {
+            interval.beforeKey = item.key;
+            open.delete(owner);
+          }
+        }
+        const owner = item.kind === "message" ? userTurnRunId(item.message) : null;
+        for (const id of [owner, target]) {
+          if (id && !bounds.has(id)) {
+            const interval = { afterKey: item.key };
+            bounds.set(id, interval);
+            open.set(id, interval);
+            if (id === target) {
+              pagedInputCeilings.set(id, { beforeKey: item.key });
+            }
+          }
+        }
+      }
+    }
+    const retainedInputBounds =
+      (afterUserSendId
+        ? (inputs.get(afterUserSendId) ?? pagedInputCeilings.get(runId))
+        : undefined) ?? bounds.get(runId);
+    if (retainedInputBounds) {
+      return retainedInputBounds;
+    }
+    // One lookup owns one fixed transcript. Bursts repeat even missing causal
+    // intervals, but different observed inputs must keep independent bounds.
+    let byInput = causalBounds.get(runId);
+    if (byInput?.has(afterUserSendId)) {
+      return byInput.get(afterUserSendId)!;
+    }
+    messages ??= items.map((item) => (item.kind === "message" ? item.message : null));
+    const interval = knownStreamCausalInterval(messages, { runId }, afterUserSendId);
+    const ceiling = interval
+      ? items.find(
+          (item, index) =>
+            index >= interval.start &&
+            index < interval.end &&
+            startsExecutionTurn(item) &&
+            (item.kind !== "message" || transcriptRunId(item.message) !== runId),
+        )
+      : undefined;
+    const result = interval
+      ? {
+          afterKey: items[interval.start - 1]?.key,
+          beforeKey: ceiling?.key ?? items[interval.end]?.key,
+        }
+      : null;
+    if (!byInput) {
+      byInput = new Map();
+      causalBounds.set(runId, byInput);
+    }
+    byInput.set(afterUserSendId, result);
+    return result;
+  };
 }
 
 export function resolveRunInsertionBounds(
-  items: ChatItem[],
+  findRunBounds: ReturnType<typeof createRunTurnLookup>,
   runId: unknown,
   currentRunId: string | null | undefined,
   currentTurnBounds: TurnInsertionBounds | null,
@@ -86,10 +174,9 @@ export function resolveRunInsertionBounds(
   if (typeof runId !== "string" || !runId.trim()) {
     return currentRunId != null ? currentTurnBounds : null;
   }
-  const runBounds = findRunTurnBounds(items, runId);
+  const runBounds = findRunBounds(runId);
   if (runId === currentRunId) {
-    // Active runs can span steers: the original prompt is a floor, not a ceiling.
-    return runBounds ? { afterKey: runBounds.afterKey } : currentTurnBounds;
+    return runBounds ?? currentTurnBounds;
   }
   if (runBounds || currentRunId == null) {
     return runBounds;
@@ -102,9 +189,11 @@ export function resolveRunInsertionBounds(
 /** A persisted invocation owns its live echo's interval even without a user send key. */
 export function applyPersistedToolInvocationBounds(
   items: ChatItem[],
-  tools: Array<{ key: string; message: unknown }>,
-  insertionBounds: Map<string, TurnInsertionBounds>,
+  tools: Array<ChatProjection<Extract<ChatItem, { kind: "message" }>>>,
 ): void {
+  if (tools.length === 0) {
+    return;
+  }
   const invocations = new Map<string, TurnInsertionBounds | null>();
   let bounds: TurnInsertionBounds = {};
   for (const item of items) {
@@ -129,13 +218,13 @@ export function applyPersistedToolInvocationBounds(
     }
   }
   for (const tool of tools) {
-    const refs = extractToolMessageRefs(tool.message);
+    const refs = extractToolMessageRefs(tool.item.message);
     const matching = refs.map((ref) =>
       ref.runId ? invocations.get(buildToolStreamIdentity(ref.runId, ref.id)) : undefined,
     );
     const [first] = matching;
     if (first && matching.every((candidate) => candidate === first)) {
-      insertionBounds.set(tool.key, first);
+      tool.bounds = first;
     }
   }
 }
